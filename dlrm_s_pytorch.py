@@ -183,7 +183,6 @@ class DLRM_Net(nn.Module):
             self.sync_dense_params = sync_dense_params
             self.loss_threshold = loss_threshold
             # create operators
-            #self.emb_l = self.create_emb(m_spa, ln_emb)
             self.emb_l = []
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
@@ -302,13 +301,6 @@ class DLRM_Net(nn.Module):
             # replicate mlp (data parallelism)
             self.bot_l_replicas = replicate(self.bot_l, device_ids)
             self.top_l_replicas = replicate(self.top_l, device_ids)
-            ## distribute embeddings (model parallelism)
-            #t_list = []
-            #for k, emb in enumerate(self.emb_l):
-            #    d = torch.device("cuda:" + str(k % ndevices))
-            #    emb.to(d)
-            #    t_list.append(emb.to(d))
-            #self.emb_l = nn.ModuleList(t_list)
             self.parallel_model_batch_size = batch_size
             self.parallel_model_is_not_prepared = False
 
@@ -319,15 +311,6 @@ class DLRM_Net(nn.Module):
         # distribute sparse features (model parallelism)
         if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
             sys.exit("ERROR: corrupted model input detected in parallel_forward call")
-
-        #t_list = []
-        #i_list = []
-        #for k, _ in enumerate(self.emb_l):
-        #    d = torch.device("cuda:" + str(k % ndevices))
-        #    t_list.append(lS_o[k].to(d))
-        #    i_list.append(lS_i[k].to(d))
-        #lS_o = t_list
-        #lS_i = i_list
 
         ### compute results in parallel ###
         # bottom mlp
