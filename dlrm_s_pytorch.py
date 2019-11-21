@@ -162,6 +162,7 @@ class DLRM_Net(nn.Module):
         sync_dense_params=True,
         loss_threshold=0.0,
         ndevices=-1,
+        emulate_8_gpu=False,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -182,6 +183,7 @@ class DLRM_Net(nn.Module):
             self.arch_interaction_itself = arch_interaction_itself
             self.sync_dense_params = sync_dense_params
             self.loss_threshold = loss_threshold
+            self.emulate_8_gpu = emulate_8_gpu
             # create operators
             self.emb_l = []
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
@@ -254,7 +256,7 @@ class DLRM_Net(nn.Module):
         return R
 
     def forward(self, dense_x, lS_o, lS_i):
-        if self.ndevices <= 1:
+        if self.ndevices <= 1 and not self.emulate_8_gpu:
             return self.sequential_forward(dense_x, lS_o, lS_i)
         else:
             return self.parallel_forward(dense_x, lS_o, lS_i)
@@ -307,7 +309,11 @@ class DLRM_Net(nn.Module):
         ### prepare input (overwrite) ###
         # scatter dense features (data parallelism)
         # print(dense_x.device)
-        dense_x = scatter(dense_x, device_ids, dim=0)
+        if not self.emulate_8_gpu:
+            dense_x = scatter(dense_x, device_ids, dim=0)
+        else:
+            dense_x = scatter(dense_x[:int(ndevices * dense_x.size(0)/8)], device_ids, dim=0)
+
         # distribute sparse features (model parallelism)
         if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
             sys.exit("ERROR: corrupted model input detected in parallel_forward call")
@@ -340,7 +346,10 @@ class DLRM_Net(nn.Module):
         t_list = []
         for k, _ in enumerate(self.emb_l):
             d = torch.device("cuda:" + str(k % ndevices))
-            y = scatter(ly[k], device_ids, dim=0)
+            if not self.emulate_8_gpu:
+                y = scatter(ly[k], device_ids, dim=0)
+            else:
+                y = scatter(ly[k][:int(ndevices * ly[k].size(0)/8)], device_ids, dim=0)
             t_list.append(y)
         # adjust the list to be ordered per device
         ly = list(map(lambda y: list(y), zip(*t_list)))
@@ -430,6 +439,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-onnx", action="store_true", default=False)
     # gpu
     parser.add_argument("--use-gpu", action="store_true", default=False)
+    parser.add_argument("--emulate-8-gpu", action="store_true", default=False)
     # debugging and profiling
     parser.add_argument("--print-freq", type=int, default=1)
     parser.add_argument("--test-freq", type=int, default=-1)
@@ -454,7 +464,11 @@ if __name__ == "__main__":
         torch.backends.cudnn.deterministic = True
         device = torch.device("cuda", 0)
         ngpus = torch.cuda.device_count()  # 1
-        print("Using {} GPU(s)...".format(ngpus))
+        if args.emulate_8_gpu:
+            extra = "(Emulating 8 GPU run)"
+        else:
+            extra = ""
+        print("Using {} GPU(s) {} ...".format(ngpus, extra))
     else:
         device = torch.device("cpu")
         print("Using CPU...")
@@ -547,6 +561,8 @@ if __name__ == "__main__":
                 return list_of_tuples[0]
 
         ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
+        if args.emulate_8_gpu:
+            ln_emb = ln_emb[:int(ngpus * ln_emb.size/8)]
         m_den = ln_bot[0]
         train_data = dp.RandomDataset(
             m_den,
@@ -687,6 +703,7 @@ if __name__ == "__main__":
         sigmoid_top=ln_top.size - 2,
         sync_dense_params=args.sync_dense_params,
         loss_threshold=args.loss_threshold,
+        emulate_8_gpu=args.emulate_8_gpu,
     )
     # test prints
     if args.debug_mode:
@@ -696,7 +713,7 @@ if __name__ == "__main__":
         # print(dlrm)
 
     if use_gpu:
-        if ngpus > 1:
+        if ngpus > 1 or args.emulate_8_gpu:
             # Custom Model-Data Parallel
             # the mlps are replicated and use data parallelism, while
             # the embeddings are distributed and use model parallelism
@@ -734,11 +751,12 @@ if __name__ == "__main__":
         else:
             return dlrm(X, lS_o, lS_i)
 
-    def loss_fn_wrap(Z, T, use_gpu, device):
+    def loss_fn_wrap(Z, T, use_gpu, device, ndevices):
         if use_gpu:
-            return loss_fn(Z, T.to(device))
-        else:
-            return loss_fn(Z, T)
+            if not args.emulate_8_gpu:
+                return loss_fn(Z, T.to(device))
+            else:
+                return loss_fn(Z, T.to(device)[:int(ndevices * T.size(0)/8)])
 
     # training or inference
     best_gA_test = 0
@@ -806,7 +824,7 @@ if __name__ == "__main__":
                 Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device, dlrm.ndevices)
 
                 # loss
-                E = loss_fn_wrap(Z, T, use_gpu, device)
+                E = loss_fn_wrap(Z, T, use_gpu, device, dlrm.ndevices)
                 '''
                 # debug prints
                 print("output and loss")
@@ -816,7 +834,10 @@ if __name__ == "__main__":
                 # compute loss and accuracy
                 L = E.detach().cpu().numpy()  # numpy array
                 S = Z.detach().cpu().numpy()  # numpy array
-                T = T.detach().cpu().numpy()  # numpy array
+                if not args.emulate_8_gpu:
+                    T = T.detach().cpu().numpy()  # numpy array
+                else:
+                    T = T[:int(dlrm.ndevices * T.size(0)/8)].detach().cpu().numpy()  # numpy array
                 mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
                 A = np.sum((np.round(S, 0) == T).astype(np.uint8)) / mbs
 
@@ -886,12 +907,15 @@ if __name__ == "__main__":
                             X_test, lS_o_test, lS_i_test, use_gpu, device, dlrm.ndevices
                         )
                         # loss
-                        E_test = loss_fn_wrap(Z_test, T_test, use_gpu, device)
+                        E_test = loss_fn_wrap(Z_test, T_test, use_gpu, device, dlrm.ndevices)
 
                         # compute loss and accuracy
                         L_test = E_test.detach().cpu().numpy()  # numpy array
                         S_test = Z_test.detach().cpu().numpy()  # numpy array
-                        T_test = T_test.detach().cpu().numpy()  # numpy array
+                        if not args.emulate_8_gpu:
+                            T_test = T_test.detach().cpu().numpy()  # numpy array
+                        else:
+                            T_test = T_test[:int(dlrm.ndevices * T_test.size(0)/8)].detach().cpu().numpy()  # numpy array
                         mbs_test = T_test.shape[
                             0
                         ]  # = args.mini_batch_size except maybe for last
