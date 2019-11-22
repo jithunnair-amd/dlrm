@@ -757,6 +757,8 @@ if __name__ == "__main__":
                 return loss_fn(Z, T.to(device))
             else:
                 return loss_fn(Z, T.to(device)[:int(ndevices * T.size(0)/8)])
+        else:
+            return loss_fn(Z, T)
 
     # training or inference
     best_gA_test = 0
