@@ -85,7 +85,7 @@ exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 ### define dlrm in PyTorch ###
 class DLRM_Net(nn.Module):
-    def create_mlp(self, ln, sigmoid_layer):
+    def create_mlp(self, ln, sigmoid_layer, use_bias=False):
         # build MLP layer by layer
         layers = nn.ModuleList()
         for i in range(0, ln.size - 1):
@@ -93,7 +93,7 @@ class DLRM_Net(nn.Module):
             m = ln[i + 1]
 
             # construct fully connected operator
-            LL = nn.Linear(int(n), int(m), bias=True)
+            LL = nn.Linear(int(n), int(m), bias=use_bias)
 
             # initialize the weights
             # with torch.no_grad():
@@ -101,11 +101,13 @@ class DLRM_Net(nn.Module):
             mean = 0.0  # std_dev = np.sqrt(variance)
             std_dev = np.sqrt(2 / (m + n))  # np.sqrt(1 / m) # np.sqrt(1 / n)
             W = np.random.normal(mean, std_dev, size=(m, n)).astype(np.float32)
-            std_dev = np.sqrt(1 / m)  # np.sqrt(2 / (m + 1))
-            bt = np.random.normal(mean, std_dev, size=m).astype(np.float32)
+            if use_bias:
+                std_dev = np.sqrt(1 / m)  # np.sqrt(2 / (m + 1))
+                bt = np.random.normal(mean, std_dev, size=m).astype(np.float32)
             # approach 1
             LL.weight.data = torch.tensor(W, requires_grad=True)
-            LL.bias.data = torch.tensor(bt, requires_grad=True)
+            if use_bias:
+                LL.bias.data = torch.tensor(bt, requires_grad=True)
             # approach 2
             # LL.weight.data.copy_(torch.tensor(W))
             # LL.bias.data.copy_(torch.tensor(bt))
@@ -155,6 +157,7 @@ class DLRM_Net(nn.Module):
         ln_emb=None,
         ln_bot=None,
         ln_top=None,
+        use_bias_in_linear=False,
         arch_interaction_op=None,
         arch_interaction_itself=False,
         sigmoid_bot=-1,
@@ -185,9 +188,9 @@ class DLRM_Net(nn.Module):
             self.loss_threshold = loss_threshold
             self.emulate_8_gpu = emulate_8_gpu
             # create operators
-            self.emb_l = []
-            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
-            self.top_l = self.create_mlp(ln_top, sigmoid_top)
+            self.emb_l = self.create_emb(m_spa, ln_emb)
+            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot, use_bias=use_bias_in_linear)
+            self.top_l = self.create_mlp(ln_top, sigmoid_top, use_bias=use_bias_in_linear)
 
     def apply_mlp(self, x, layers):
         # approach 1: use ModuleList
@@ -401,6 +404,7 @@ if __name__ == "__main__":
     # j will be replaced with the table number
     parser.add_argument("--arch-mlp-bot", type=str, default="4-3-2")
     parser.add_argument("--arch-mlp-top", type=str, default="4-2-1")
+    parser.add_argument("--use-bias-in-linear", type=bool, default=False)
     parser.add_argument("--arch-interaction-op", type=str, default="dot")
     parser.add_argument("--arch-interaction-itself", action="store_true", default=False)
     # activations and loss
@@ -450,6 +454,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--save-model", type=str, default="")
     parser.add_argument("--load-model", type=str, default="")
+    parser.add_argument("--num-warmup-iters", type=int, default=10)
     args = parser.parse_args()
 
     ### some basic setup ###
@@ -697,6 +702,7 @@ if __name__ == "__main__":
         ln_emb,
         ln_bot,
         ln_top,
+        use_bias_in_linear=args.use_bias_in_linear,
         arch_interaction_op=args.arch_interaction_op,
         arch_interaction_itself=args.arch_interaction_itself,
         sigmoid_bot=-1,
@@ -766,6 +772,8 @@ if __name__ == "__main__":
     total_loss = 0
     total_accu = 0
     total_iter = 0
+    total_time_global = 0
+    total_iter_global = 0
     k = 0
 
     # Load model is specified
@@ -804,6 +812,22 @@ if __name__ == "__main__":
                 ld_nbatches_test, ld_gL_test, ld_gA_test * 100
             )
         )
+
+    ## warmup runs
+    print("Running warmup iters...")
+    for wj, (X, lS_o, lS_i, T) in enumerate(train_loader):
+        if wj >= args.num_warmup_iters:
+            break
+        #forward pass
+        Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
+        #loss
+        E = loss_fn_wrap(Z, T, use_gpu, device)
+        #backward pass
+        if not args.inference_only:
+            optimizer.zero_grad()
+            E.backward()
+            optimizer.step()
+    print("Finished warmup iters.")
 
     print("time/loss/accuracy (if enabled):")
     with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
@@ -862,6 +886,8 @@ if __name__ == "__main__":
                 total_accu += A
                 total_loss += L
                 total_iter += 1
+                total_time_global += t2 - t1
+                total_iter_global += 1
 
                 print_tl = ((j + 1) % args.print_freq == 0) or (j + 1 == nbatches)
                 print_ts = (
@@ -966,6 +992,11 @@ if __name__ == "__main__":
                     )
 
             k += 1  # nepochs
+
+    # print global stats
+    print("Total iterations ran: ", total_iter_global)
+    print("Average number of iters/sec: ", total_iter_global/total_time_global)
+    print("Average milliseconds per iter: ", 1000*total_time_global/total_iter_global)
 
     # profiling
     if args.enable_profiling:
