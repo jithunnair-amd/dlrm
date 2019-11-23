@@ -188,7 +188,7 @@ class DLRM_Net(nn.Module):
             self.loss_threshold = loss_threshold
             self.emulate_8_gpu = emulate_8_gpu
             # create operators
-            self.emb_l = self.create_emb(m_spa, ln_emb)
+            self.emb_l = []
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot, use_bias=use_bias_in_linear)
             self.top_l = self.create_mlp(ln_top, sigmoid_top, use_bias=use_bias_in_linear)
 
@@ -819,9 +819,9 @@ if __name__ == "__main__":
         if wj >= args.num_warmup_iters:
             break
         #forward pass
-        Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
+        Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device, dlrm.ndevices)
         #loss
-        E = loss_fn_wrap(Z, T, use_gpu, device)
+        E = loss_fn_wrap(Z, T, use_gpu, device, dlrm.ndevices)
         #backward pass
         if not args.inference_only:
             optimizer.zero_grad()
