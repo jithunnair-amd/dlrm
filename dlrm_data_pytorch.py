@@ -32,7 +32,9 @@ from numpy import random as ra
 
 # pytorch
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, RandomSampler
+
+import data_loader_terabyte
 
 
 # Kaggle Display Advertising Challenge Dataset
@@ -126,14 +128,14 @@ class CriteoDataset(Dataset):
         # setup data
         if memory_map:
             # setup the training/testing split
-            self.day_boundary = 0
             self.split = split
             if split == 'none' or split == 'train':
                 self.day = 0
+                self.max_day_range = days if split == 'none' else days - 1
             elif split == 'test' or split == 'val':
                 self.day = days - 1
-                num_samples = self.offset_per_file[self.day - 1] - \
-                              self.offset_per_file[self.day - 2]
+                num_samples = self.offset_per_file[days] - \
+                              self.offset_per_file[days - 1]
                 self.test_size = int(np.ceil(num_samples / 2.))
                 self.val_size = num_samples - self.test_size
             else:
@@ -180,6 +182,19 @@ class CriteoDataset(Dataset):
             self.m_den = den_fea  # X_int.shape[1]
             self.n_emb = len(self.counts)
             print("Sparse features= %d, Dense features= %d" % (self.n_emb, self.m_den))
+
+            # Load the test data
+            # Only a single day is used for testing
+            if self.split == 'test' or self.split == 'val':
+                # only a single day is used for testing
+                fi = self.npzfile + "_{0}_reordered.npz".format(
+                    self.day
+                )
+                with np.load(fi) as data:
+                    self.X_int = data["X_int"]  # continuous  feature
+                    self.X_cat = data["X_cat"]  # categorical feature
+                    self.y = data["y"]          # target
+
         else:
             # load and preprocess data
             with np.load(file) as data:
@@ -258,31 +273,26 @@ class CriteoDataset(Dataset):
                     fi = self.npzfile + "_{0}_reordered.npz".format(
                         self.day
                     )
+                    # print('Loading file: ', fi)
                     with np.load(fi) as data:
                         self.X_int = data["X_int"]  # continuous  feature
                         self.X_cat = data["X_cat"]  # categorical feature
                         self.y = data["y"]          # target
-                    self.day += 1
+                    self.day = (self.day + 1) % self.max_day_range
 
                 i = index - self.day_boundary
             elif self.split == 'test' or self.split == 'val':
                 # only a single day is used for testing
-                if index == 0:
-                    fi = self.npzfile + "_{0}_reordered.npz".format(
-                        self.day
-                    )
-                    with np.load(fi) as data:
-                        self.X_int = data["X_int"]  # continuous  feature
-                        self.X_cat = data["X_cat"]  # categorical feature
-                        self.y = data["y"]          # target
-
                 i = index + (0 if self.split == 'test' else self.test_size)
             else:
                 sys.exit("ERROR: dataset split is neither none, nor train or test.")
         else:
             i = index
 
-        return self.X_int[i], self.X_cat[i], self.y[i]
+        if self.max_ind_range > 0:
+            return self.X_int[i], self.X_cat[i] % self.max_ind_range, self.y[i]
+        else:
+            return self.X_int[i], self.X_cat[i], self.y[i]
 
     def _default_preprocess(self, X_int, X_cat, y):
         X_int = torch.log(torch.tensor(X_int, dtype=torch.float) + 1)
@@ -297,9 +307,9 @@ class CriteoDataset(Dataset):
     def __len__(self):
         if self.memory_map:
             if self.split == 'none':
-                return self.offset_per_file[self.day - 1]
+                return self.offset_per_file[-1]
             elif self.split == 'train':
-                return self.offset_per_file[self.day - 2]
+                return self.offset_per_file[-2]
             elif self.split == 'test':
                 return self.test_size
             elif self.split == 'val':
@@ -326,9 +336,8 @@ def collate_wrapper_criteo(list_of_tuples):
     return X_int, torch.stack(lS_o), torch.stack(lS_i), T
 
 
-def make_criteo_data_and_loaders(args):
-
-    train_data = CriteoDataset(
+def ensure_dataset_preprocessed(args, d_path):
+    _ = CriteoDataset(
         args.data_set,
         args.max_ind_range,
         args.data_sub_sample_rate,
@@ -338,17 +347,8 @@ def make_criteo_data_and_loaders(args):
         args.processed_data_file,
         args.memory_map
     )
-    train_loader = torch.utils.data.DataLoader(
-        train_data,
-        batch_size=args.mini_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_wrapper_criteo,
-        pin_memory=False,
-        drop_last=False,  # True
-    )
 
-    test_data = CriteoDataset(
+    _ = CriteoDataset(
         args.data_set,
         args.max_ind_range,
         args.data_sub_sample_rate,
@@ -358,15 +358,163 @@ def make_criteo_data_and_loaders(args):
         args.processed_data_file,
         args.memory_map
     )
-    test_loader = torch.utils.data.DataLoader(
-        test_data,
-        batch_size=args.test_mini_batch_size,
-        shuffle=False,
-        num_workers=args.test_num_workers,
-        collate_fn=collate_wrapper_criteo,
-        pin_memory=False,
-        drop_last=False,  # True
-    )
+
+    for split in ['train', 'val', 'test']:
+        print('Running preprocessing for split =', split)
+
+        train_files = ['{}_{}_reordered.npz'.format(args.raw_data_file, day)
+                       for
+                       day in range(0, 23)]
+
+        test_valid_file = args.raw_data_file + '_23_reordered.npz'
+
+        output_file = d_path + '_{}.bin'.format(split)
+
+        input_files = train_files if split == 'train' else [test_valid_file]
+        data_loader_terabyte.numpy_to_binary(input_files=input_files,
+                                             output_file_path=output_file,
+                                             split=split)
+
+
+def make_criteo_data_and_loaders(args):
+
+    if args.mlperf_logging and args.memory_map and args.data_set == "terabyte":
+        # more efficient for larger batches
+        data_directory = path.dirname(args.raw_data_file)
+
+        if args.mlperf_bin_loader:
+            lstr = args.processed_data_file.split("/")
+            d_path = "/".join(lstr[0:-1]) + "/" + lstr[-1].split(".")[0]
+            train_file = d_path + "_train.bin"
+            test_file = d_path + "_test.bin"
+            # val_file = d_path + "_val.bin"
+            counts_file = args.raw_data_file + '_fea_count.npz'
+
+            if any(not path.exists(p) for p in [train_file,
+                                                test_file,
+                                                counts_file]):
+                ensure_dataset_preprocessed(args, d_path)
+
+            train_data = data_loader_terabyte.CriteoBinDataset(
+                data_file=train_file,
+                counts_file=counts_file,
+                batch_size=args.mini_batch_size,
+                max_ind_range=args.max_ind_range
+            )
+
+            train_loader = torch.utils.data.DataLoader(
+                train_data,
+                batch_size=None,
+                batch_sampler=None,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=None,
+                pin_memory=False,
+                drop_last=False,
+                sampler=RandomSampler(train_data) if args.mlperf_bin_shuffle else None
+            )
+
+            test_data = data_loader_terabyte.CriteoBinDataset(
+                data_file=test_file,
+                counts_file=counts_file,
+                batch_size=args.test_mini_batch_size,
+                max_ind_range=args.max_ind_range
+            )
+
+            test_loader = torch.utils.data.DataLoader(
+                test_data,
+                batch_size=None,
+                batch_sampler=None,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=None,
+                pin_memory=False,
+                drop_last=False,
+            )
+        else:
+            data_filename = args.raw_data_file.split("/")[-1]
+
+            train_data = CriteoDataset(
+                args.data_set,
+                args.max_ind_range,
+                args.data_sub_sample_rate,
+                args.data_randomize,
+                "train",
+                args.raw_data_file,
+                args.processed_data_file,
+                args.memory_map
+            )
+
+            test_data = CriteoDataset(
+                args.data_set,
+                args.max_ind_range,
+                args.data_sub_sample_rate,
+                args.data_randomize,
+                "test",
+                args.raw_data_file,
+                args.processed_data_file,
+                args.memory_map
+            )
+
+            train_loader = data_loader_terabyte.DataLoader(
+                data_directory=data_directory,
+                data_filename=data_filename,
+                days=list(range(23)),
+                batch_size=args.mini_batch_size,
+                max_ind_range=args.max_ind_range,
+                split="train"
+            )
+
+            test_loader = data_loader_terabyte.DataLoader(
+                data_directory=data_directory,
+                data_filename=data_filename,
+                days=[23],
+                batch_size=args.test_mini_batch_size,
+                max_ind_range=args.max_ind_range,
+                split="test"
+            )
+    else:
+        train_data = CriteoDataset(
+            args.data_set,
+            args.max_ind_range,
+            args.data_sub_sample_rate,
+            args.data_randomize,
+            "train",
+            args.raw_data_file,
+            args.processed_data_file,
+            args.memory_map
+        )
+
+        test_data = CriteoDataset(
+            args.data_set,
+            args.max_ind_range,
+            args.data_sub_sample_rate,
+            args.data_randomize,
+            "test",
+            args.raw_data_file,
+            args.processed_data_file,
+            args.memory_map
+        )
+
+        train_loader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=args.mini_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collate_wrapper_criteo,
+            pin_memory=False,
+            drop_last=False,  # True
+        )
+
+        test_loader = torch.utils.data.DataLoader(
+            test_data,
+            batch_size=args.test_mini_batch_size,
+            shuffle=False,
+            num_workers=args.test_num_workers,
+            collate_fn=collate_wrapper_criteo,
+            pin_memory=False,
+            drop_last=False,  # True
+        )
 
     return train_data, train_loader, test_data, test_loader
 
@@ -507,7 +655,6 @@ def make_random_data_and_loader(args, ln_emb, m_den):
         drop_last=False,  # True
     )
     return train_data, train_loader
-
 
 
 def generate_random_data(
