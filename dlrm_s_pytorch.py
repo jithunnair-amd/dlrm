@@ -875,7 +875,7 @@ if __name__ == "__main__":
 
     ## warmup runs
     print("Running warmup iters...")
-    for wj, (X, lS_o, lS_i, T) in enumerate(train_loader):
+    for wj, (X, lS_o, lS_i, T) in enumerate(train_ld):
         if wj >= args.num_warmup_iters:
             break
         #forward pass
